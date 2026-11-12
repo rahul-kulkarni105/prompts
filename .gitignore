@@ -32,6 +32,3 @@ CLAUDE.local.md
 tmp/
 scratch/
 drafts/
-
-# Node
-node_modules/
