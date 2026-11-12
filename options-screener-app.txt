@@ -1,0 +1,927 @@
+# Put Spread Weekly Screener — Full Build Prompt
+
+Build a production-quality local web app called “Put Spread Weekly Screener” for ranking weekly put credit spread candidates.
+
+This is a local-first trading research/screening dashboard. It is not a marketing landing page. The UI must be compact, practical, responsive, dashboard-like, and mobile-first.
+
+Important: this app is for educational/research use only. Add a visible disclaimer that delayed market data may be inaccurate or unavailable and that the tool is not financial advice.
+
+---
+
+## 1. Core Product Goal
+
+Build a local web application that lets me screen, rank, review, and track weekly put credit spread candidates.
+
+The app should:
+
+- Let me select a weekly option expiry.
+- Pull delayed option-chain data.
+- Pull earnings/event/macro data.
+- Pull historical daily closes.
+- Apply trend, volatility, liquidity, and risk gates.
+- Rank candidate put credit spreads.
+- Generate copyable order tickets.
+- Let me track selected positions in localStorage.
+- Alert me when tracked positions hit predefined risk/profit conditions.
+
+---
+
+## 2. Tech Stack
+
+Use:
+
+- Node.js server
+- React app built with Vite
+- TypeScript preferred where practical
+- Redux Toolkit
+- RTK Query
+- CSS, no heavyweight UI framework unless truly justified
+- oxlint
+- Prettier
+- Git repo initialized locally
+- Proper `.gitignore`
+- Package manager: npm unless there is a clear reason to use pnpm
+
+Important architecture requirement:
+
+- I want only the Node server serving the app.
+- Do not require me to run a separate frontend dev server and backend server.
+- Vite should be used as the React build tool.
+- The Node server should serve the built React bundle from `dist`.
+- Provide scripts so I can run one command and access the app from the Node server.
+- It is acceptable to have a build/watch process during development, but the browser should always hit the Node server, not a separate Vite client server.
+
+Recommended scripts:
+
+- `npm install`
+- `npm run dev` — builds/watches the React app and runs the Node server
+- `npm run build` — builds the React app
+- `npm start` — starts the Node server and serves the built bundle
+- `npm run lint`
+- `npm run format`
+- `npm test`
+
+Use appropriate Node middlewares and libraries for security, validation, logging, compression, and rate limiting. Keep the server lightweight and maintainable.
+
+---
+
+## 3. Server Requirements
+
+Create a lightweight Node.js server.
+
+Expose:
+
+### Static App
+
+- Serve the React bundle from the Vite build output.
+- Support SPA fallback to `index.html`.
+
+### API Endpoint
+
+Expose:
+
+```http
+POST /api/screen
+```
+
+The endpoint should accept the current screening settings and return:
+
+```ts
+{
+  asOf: string;
+  expiry: string;
+  marketContext: {
+    vix: number | null;
+    vixRegime: "thin" | "normal" | "rich" | "avoid" | "unknown";
+    vixTrend: "stable" | "rising" | "falling" | "unknown";
+    macroWarnings: string[];
+  };
+  results: RankedSpread[];
+  skippedSymbols: SkippedSymbol[];
+  dataWarnings: string[];
+}
+```
+
+Also expose lightweight health/debug endpoints:
+
+```http
+GET /api/health
+GET /api/sources/status
+```
+
+Use request validation with a schema library such as Zod.
+
+Add:
+
+- Input validation
+- Defensive error handling
+- API response normalization
+- Per-source timeout handling
+- Retry with backoff where reasonable
+- In-memory caching for external data
+- Cache TTLs per data source
+- Clear warning messages when data is delayed, missing, stale, blocked, or partially unavailable
+- Rate limiting for local API abuse protection
+- Security headers
+- Compression
+- Structured server logs
+
+Do not crash the app if one source fails. Return partial results with warnings.
+
+---
+
+## 4. Data Sources
+
+Create clean data-source adapter modules so each source is isolated and replaceable.
+
+### Option Chain
+
+Pull delayed option-chain data from Cboe.
+
+Needed fields, where available:
+
+- underlying price
+- expiry
+- strike
+- bid
+- ask
+- mid
+- volume
+- open interest
+- delta
+- implied volatility
+- IV30 if available or reasonably derivable
+
+If Cboe blocks or changes response shape, fail gracefully and return a data warning.
+
+### Earnings Calendar
+
+Pull earnings calendar data from Nasdaq.
+
+Auto-block symbols with earnings before the selected expiry.
+
+If exact earnings date is unavailable, mark as uncertain and add a warning.
+
+### Macro Events
+
+Pull:
+
+- Federal Reserve FOMC calendar
+- BEA release schedule
+
+Also include a manual macro-events field for CPI/jobs or any events not auto-sourced.
+
+For macro events:
+
+- Detect high-impact events before expiry.
+- Add warnings to affected screens.
+- Allow user to disable auto-events.
+- Allow user to manually enter events using a compact text field.
+
+### Historical Daily Closes
+
+Pull historical daily closes from:
+
+1. Yahoo Finance first
+2. Nasdaq historical data as fallback
+
+Needed for:
+
+- 20-day SMA
+- 50-day SMA
+- 5-day price change
+- 20-day support
+- RSI 14
+- MACD 12/26/9 histogram
+- VIX history and trend
+
+Handle missing or sparse history safely.
+
+---
+
+## 5. User Controls
+
+The UI must include controls for:
+
+- Symbol universe
+- Manual blocklist
+- Selected expiry
+- Auto events toggle
+- Manual macro events
+- Minimum short-put delta
+- Maximum short-put delta
+- Minimum credit as % of spread width
+- Maximum spread width
+- Minimum open interest
+- Minimum volume
+- Trend gate toggle
+- VIX regime gate toggle
+- Account size
+- Risk per idea %
+- Max weekly risk %
+- Correlation group cap %
+
+Persist all settings in localStorage.
+
+Do not auto-run screening:
+
+- Do not screen on page load.
+- Do not screen when settings change.
+- Screening runs only when I click `Screen Picks`.
+
+---
+
+## 6. Strategy Logic
+
+Screen put credit spreads for the selected expiry.
+
+For each symbol:
+
+1. Fetch current underlying/option-chain data.
+2. Fetch historical closes.
+3. Fetch earnings data.
+4. Fetch macro/event data if enabled.
+5. Apply blocklist and event filters.
+6. Generate candidate put credit spreads.
+7. Apply liquidity, delta, width, credit, trend, and VIX gates.
+8. Rank remaining candidates.
+9. Return skipped symbols with clear reasons.
+
+### Put Credit Spread Construction
+
+For each candidate:
+
+- Short leg must be a put.
+- Long leg must be a lower-strike put.
+- Spread width must be <= max spread width.
+- Short delta must be between min/max short-put delta.
+- Credit must be >= minimum credit as % of spread width.
+- Open interest must meet minimum.
+- Volume must meet minimum.
+- Calculate:
+  - net credit
+  - max loss
+  - breakeven
+  - risk/reward
+  - distance below spot
+  - expected move
+  - expected-move low
+  - quote spread width
+  - suggested contracts
+
+Use conservative pricing:
+
+- Prefer bid/ask-based realistic credit.
+- Do not overstate credit by using only theoretical mid.
+- Show both mid credit and conservative executable credit where possible.
+
+---
+
+## 7. Trend Validation
+
+Trend validation should use:
+
+- 20-day SMA
+- 50-day SMA
+- 5-day price change
+- 20-day support
+- RSI 14
+- MACD 12/26/9 histogram
+
+Create a trend status:
+
+```ts
+"strong" | "acceptable" | "weak" | "bearish" | "unknown"
+```
+
+A good candidate generally has:
+
+- price above or near key moving averages
+- positive or stable 5-day price action
+- short strike below recent support
+- RSI not severely overbought
+- MACD histogram not materially weakening
+
+Do not hard-fail everything if trend data is incomplete. Add warnings and lower ranking.
+
+---
+
+## 8. VIX Logic
+
+Implement VIX regime logic:
+
+- VIX < 15:
+  - thin premium
+  - reduce target delta
+  - reduce size
+  - add warning
+- VIX 15–22:
+  - normal
+- VIX 22–30:
+  - rich premium
+  - reduce size
+  - add caution warning
+- VIX > 30:
+  - avoid new weekly bullish spreads
+  - strongly warn or block when VIX gate is enabled
+
+Detect VIX trend from recent history:
+
+```ts
+"stable" | "rising" | "falling" | "unknown"
+```
+
+If VIX is rising, penalize bullish put spreads.
+
+---
+
+## 9. Ranking Model
+
+Rank spread candidates using a transparent scoring model.
+
+Consider:
+
+- short delta near target
+- credit quality
+- credit as % of spread width
+- liquidity
+- open interest
+- volume
+- bid/ask quote tightness
+- distance below spot
+- expected-move low
+- short strike relative to expected move
+- short strike relative to 20-day support
+- trend status
+- RSI status
+- MACD histogram/momentum status
+- earnings risk
+- macro risk
+- high-beta symbol risk
+- VIX regime risk
+- correlation group concentration
+
+Each spread should include:
+
+```ts
+score: number;
+scoreBreakdown: {
+  deltaFit: number;
+  creditQuality: number;
+  liquidity: number;
+  distanceSafety: number;
+  trend: number;
+  momentum: number;
+  support: number;
+  eventRisk: number;
+  vixRisk: number;
+  quoteQuality: number;
+};
+```
+
+Make the ranking explainable in the UI.
+
+---
+
+## 10. Warnings
+
+Add warnings for:
+
+- earnings before expiry
+- uncertain earnings date before expiry
+- high-impact macro events
+- RSI stretched
+- weak RSI/MACD momentum
+- short strike inside expected move
+- short strike above 20-day support
+- wide quote spreads
+- low open interest
+- low volume
+- high-beta names
+- VIX risk regime
+- VIX rising
+- stale/missing data
+- quote data delayed
+- risk budget exceeded
+- correlation group cap exceeded
+
+Warnings should be visible but compact.
+
+---
+
+## 11. Risk and Position Sizing
+
+Use:
+
+- account size
+- risk per idea %
+- max weekly risk %
+- correlation group cap %
+
+Calculate:
+
+- max dollar risk per idea
+- max total weekly risk
+- max group risk
+- max contracts per candidate
+- suggested contracts
+
+Use max loss per spread:
+
+```ts
+maxLoss = spreadWidth * 100 - netCredit * 100
+```
+
+Never suggest contracts that exceed configured risk limits.
+
+If suggested contracts is 0, still show the spread but clearly mark it as over risk limit.
+
+---
+
+## 12. Correlation Groups
+
+Create a practical static correlation-group map for common symbols, for example:
+
+- Mega-cap tech
+- Semiconductors
+- Financials
+- Energy
+- Industrials
+- Consumer discretionary
+- Consumer staples
+- Healthcare
+- Index ETFs
+- High-beta/speculative
+
+Allow unmapped symbols to fall into `Other`.
+
+Use correlation group cap % to prevent concentration.
+
+---
+
+## 13. UI Requirements
+
+Use a mobile-first responsive dashboard layout.
+
+Panels:
+
+1. Strategy Rules
+2. Market & Risk Rules
+3. Auto Events
+4. Ranked Spreads
+5. Order Tickets
+6. Skipped Symbols
+7. Position Monitor
+
+Design principles:
+
+- Compact, practical, information-dense
+- Clear hierarchy
+- Fast to scan
+- No marketing hero section
+- No oversized empty cards
+- Mobile-first layout
+- Desktop should use multi-column dashboard layout
+- Accessible contrast
+- Keyboard-friendly controls
+- Good loading states
+- Good empty states
+- Clear error states
+
+Do not auto-run screening.
+
+Primary CTA:
+
+```txt
+Screen Picks
+```
+
+Secondary actions:
+
+```txt
+Reset Settings
+Clear Results
+Export Results JSON
+```
+
+---
+
+## 14. Spread Card Requirements
+
+Each spread card should show:
+
+- symbol
+- underlying price
+- IV30
+- expiry
+- sell strike
+- buy strike
+- spread width
+- conservative credit
+- mid credit
+- credit as % of width
+- max loss
+- breakeven
+- suggested contracts
+- correlation group
+- expected move
+- expected-move low
+- distance below spot
+- 20-day support
+- RSI 14
+- MACD histogram
+- momentum status
+- trend status
+- VIX regime warning if relevant
+- score
+- score breakdown
+- warnings
+
+Actions:
+
+- Copy order ticket
+- Track Position
+- Expand/collapse details
+
+---
+
+## 15. Order Tickets
+
+Generate copyable order tickets.
+
+Include:
+
+- action: sell put credit spread
+- symbol
+- expiry
+- sell put strike
+- buy put strike
+- target credit
+- suggested contracts
+- max loss
+- breakeven
+
+Add copy buttons.
+
+Example ticket text:
+
+```txt
+SELL 1 XYZ 2026-05-15 95/90 PUT CREDIT SPREAD @ 1.05 CREDIT
+Max loss: $395
+Breakeven: 93.95
+```
+
+Use the app’s calculated values.
+
+---
+
+## 16. Position Monitor
+
+Position monitor should store positions in localStorage.
+
+A user can click `Track Position` from a spread card.
+
+Tracked position fields:
+
+- id
+- symbol
+- expiry
+- sell strike
+- buy strike
+- entry credit
+- current estimated spread value
+- underlying price
+- short delta
+- contracts
+- max loss
+- openedAt
+- notes
+- status
+
+Alerts for:
+
+- 50% profit target
+- 70% profit target
+- spread value reaching 2x entry credit
+- short delta 0.35+
+- underlying at or below short strike
+- expiry risk window
+- stale data
+- missing current option quote
+
+Allow:
+
+- remove position
+- mark closed
+- update notes
+- refresh monitor
+
+Do not require a database. Use localStorage.
+
+---
+
+## 17. State Management
+
+Use Redux Toolkit.
+
+Use RTK Query for API calls:
+
+- `/api/screen`
+- `/api/health`
+- `/api/sources/status`
+
+Use localStorage for:
+
+- saved settings
+- tracked positions
+- last selected expiry
+- manual blocklist
+- manual macro events
+
+Keep state clean and normalized.
+
+---
+
+## 18. Error Handling and Data Quality
+
+The app must handle:
+
+- failed external source
+- partial option chain data
+- missing greeks
+- missing IV
+- stale quote data
+- no matching expiry
+- no valid spreads
+- blocked symbols
+- malformed user input
+- server timeout
+- invalid API response
+
+Show user-friendly messages.
+
+Never silently hide data-source failures.
+
+---
+
+## 19. Security and Performance
+
+Prioritize:
+
+- clean input validation
+- no secrets in client bundle
+- no hardcoded private credentials
+- no eval
+- no unsafe HTML injection
+- security headers
+- rate limiting
+- compression
+- request timeouts
+- caching external data
+- efficient option-chain parsing
+- memoized calculations where useful
+- small client bundle
+- no unnecessary dependencies
+
+Add a `.env.example` for configurable values, even if no API keys are needed initially.
+
+---
+
+## 20. Code Quality
+
+Code must be:
+
+- clean
+- maintainable
+- modular
+- readable
+- typed where practical
+- easy to extend
+- easy to debug
+
+Use a structure similar to:
+
+```txt
+/
+  server/
+    index.ts or index.js
+    api/
+    dataSources/
+    services/
+    scoring/
+    utils/
+    validation/
+  src/
+    app/
+    components/
+    features/
+    hooks/
+    services/
+    store/
+    styles/
+    types/
+    utils/
+  public/
+  .github/
+  AGENTS.md
+  CLAUDE.md
+  README.md
+  package.json
+  vite.config.ts
+  oxlint.json
+  prettier.config.js
+  .gitignore
+  .env.example
+```
+
+Avoid huge files. Split logic clearly.
+
+---
+
+## 21. Testing
+
+Add tests for important pure logic:
+
+- spread construction
+- max loss calculation
+- breakeven calculation
+- credit % calculation
+- RSI calculation
+- MACD calculation
+- SMA calculation
+- VIX regime classification
+- VIX trend classification
+- scoring
+- risk sizing
+- warning generation
+- localStorage serialization helpers
+
+Use a lightweight test runner such as Vitest.
+
+Add enough tests to prove core calculations are reliable.
+
+---
+
+## 22. Git and Repo Setup
+
+Initialize this as a git repo.
+
+Create a proper `.gitignore` for:
+
+- node_modules
+- dist
+- coverage
+- logs
+- env files
+- OS/editor artifacts
+
+Create a strong README with:
+
+- project overview
+- disclaimer
+- setup steps
+- scripts
+- data source notes
+- known limitations
+- troubleshooting
+- architecture summary
+
+---
+
+## 23. AI Agent Instruction Setup
+
+Create state-of-the-art AI instruction files designed around:
+
+1. Token usage optimization
+2. Best context management
+3. Zero negative impact on output quality
+
+Create:
+
+```txt
+AGENTS.md
+CLAUDE.md
+.github/copilot-instructions.md
+.github/workflows/ci.yml
+.github/ISSUE_TEMPLATE/bug_report.md
+.github/ISSUE_TEMPLATE/feature_request.md
+.github/pull_request_template.md
+```
+
+The AI instruction files should be concise, high-signal, and optimized for coding agents.
+
+They should include:
+
+- project purpose
+- architecture map
+- source-of-truth files
+- commands to run
+- strict development rules
+- testing rules
+- security rules
+- performance rules
+- context-management rules
+- when to read files
+- when not to read files
+- how to avoid token waste
+- how to make minimal targeted changes
+- how to preserve behavior
+- how to document assumptions
+- how to validate changes
+
+For Codex, use root `AGENTS.md`.
+
+For Claude Code, use root `CLAUDE.md`.
+
+For GitHub Copilot, use `.github/copilot-instructions.md`.
+
+Avoid bloated instructions. The files should be useful, compact, and enforceable.
+
+---
+
+## 24. CI Setup
+
+Create `.github/workflows/ci.yml`.
+
+CI should run:
+
+- install
+- lint
+- format check
+- tests
+- build
+
+Make the workflow practical and not overcomplicated.
+
+---
+
+## 25. Acceptance Criteria
+
+The project is complete when:
+
+- The Node server starts successfully.
+- The React app is served by the Node server.
+- The app loads in the browser.
+- Static HTML/CSS/JS load correctly.
+- `/api/health` works.
+- `/api/sources/status` works.
+- `/api/screen` accepts settings and returns normalized results or clear warnings.
+- Screening does not run until `Screen Picks` is clicked.
+- Settings persist in localStorage.
+- Tracked positions persist in localStorage.
+- Spread cards show all required fields.
+- Order-ticket copy buttons work.
+- Track Position works.
+- Position monitor shows alerts.
+- Skipped symbols are shown with reasons.
+- Data-source failures are visible and non-fatal.
+- Tests pass.
+- Lint passes.
+- Build passes.
+- Git repo is initialized.
+- README exists.
+- `.github/`, `AGENTS.md`, and `CLAUDE.md` are created.
+
+---
+
+## 26. Important Implementation Notes
+
+Be pragmatic.
+
+If an external source is unavailable, blocked, or has changed response format:
+
+- Do not fake live data.
+- Add a clear warning.
+- Keep the app functional.
+- Use adapter boundaries so the data source can be fixed later.
+
+Do not over-engineer with a database, authentication, cloud services, or a heavyweight backend framework.
+
+Do not create a marketing site.
+
+Do not make the UI flashy at the expense of usability.
+
+Focus on correctness, maintainability, safety, and practical trading workflow.
+
+At the end:
+
+1. Start the local server.
+2. Verify the page loads.
+3. Verify JS and CSS load.
+4. Verify `/api/health`.
+5. Verify `/api/sources/status`.
+6. Verify `/api/screen` with a sample payload.
+7. Run lint, tests, and build.
+8. Report what works and any limitations honestly.
+
+---
+
+## Optional Strict Agent Instruction
+
+Use this instruction at the very top if you want stricter behavior:
+
+```md
+Do not ask me broad clarification questions. Make practical assumptions, implement the app, and document assumptions in README.md. Only ask if a decision would fundamentally change the architecture.
+```
+
+This helps prevent the coding agent from stalling on minor decisions.
